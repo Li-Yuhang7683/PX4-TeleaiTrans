@@ -28,6 +28,7 @@ px4_add_module(
 		ControllerTypes.hpp
 		FinalMotorOutputMap.hpp
 		GroundStationGate.hpp
+		AirlinkLandingGuard.hpp
 		LqiCoaxialCollectiveCore.hpp
 		LqiCoaxialCollectiveModel.hpp
 		LqiCoaxialCollectivePayload.hpp

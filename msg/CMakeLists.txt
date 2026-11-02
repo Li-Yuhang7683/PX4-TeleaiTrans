@@ -47,6 +47,10 @@ set(msg_files
 	AdcReport.msg
 	Airspeed.msg
 	AirspeedWind.msg
+	AirlinkActuatorCommand.msg
+	AirlinkPairCommand.msg
+	AirlinkStatus.msg
+	AirlinkTestResult.msg
 	AutotuneAttitudeControlStatus.msg
 	ButtonEvent.msg
 	CameraCapture.msg

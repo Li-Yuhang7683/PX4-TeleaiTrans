@@ -74,6 +74,12 @@ static constexpr wq_config_t INS3{"wq:INS3", 6000, -17};
 
 static constexpr wq_config_t hp_default{"wq:hp_default", 2800, -18};
 
+// AIRLINK has a deep receive-to-handshake call chain and full-frame temporaries.
+// Keep it isolated from hp_default, but run it above ordinary high-priority work
+// so a 500 Hz, 6 Mbaud receive burst cannot accumulate behind unrelated tasks.
+// Keep it below rate control, SPI and I2C; it shares the INS priority tier.
+static constexpr wq_config_t airlink{"wq:airlink", 8192, -14};
+
 static constexpr wq_config_t uavcan{"wq:uavcan", 3624, -19};
 
 static constexpr wq_config_t ttyS0{"wq:ttyS0", 1728, -21};

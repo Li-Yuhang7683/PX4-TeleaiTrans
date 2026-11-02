@@ -9,6 +9,7 @@
 #include "ControllerBackend.hpp"
 #include "GroundStationGate.hpp"
 #include "NNVerificationProtocol.hpp"
+#include "AirlinkLandingGuard.hpp"
 
 #include <drivers/drv_hrt.h>
 #include <lib/perf/perf_counter.h>
@@ -25,6 +26,9 @@
 #include <uORB/topics/actuator_motors.h>
 #include <uORB/topics/actuator_servos.h>
 #include <uORB/topics/actuator_servos_trim.h>
+#include <uORB/topics/airlink_actuator_command.h>
+#include <uORB/topics/airlink_pair_command.h>
+#include <uORB/topics/airlink_status.h>
 #include <uORB/topics/arming_check_reply.h>
 #include <uORB/topics/arming_check_request.h>
 #include <uORB/topics/battery_status.h>
@@ -43,6 +47,7 @@
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_control_mode.h>
+#include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
 
@@ -78,6 +83,8 @@ private:
 		InvalidOutput,
 		BackendOutputDisabled,
 		AirframeMismatch,
+		AirlinkCommandStale,
+		SingleLanding,
 	};
 
 	void Run() override;
@@ -88,14 +95,20 @@ private:
 	void publishArmingCheckReply(const arming_check_request_s &request);
 	void updateManualSource(hrt_abstime now);
 	void handleFlightPhaseTransitions();
-	bool buildInput(ControllerInput &input, hrt_abstime now);
+	bool buildInput(ControllerInput &input, hrt_abstime now, bool synthetic_landing = false);
 	bool rcManualControlValid(hrt_abstime now);
 	bool flightModeSlotValid(hrt_abstime now, uint8_t &mode_slot);
 	bool gsLinkControlValid(hrt_abstime now);
 	void publishGsLinkStatus(hrt_abstime now);
-	bool actuatorAuthorityAllowed();
+	bool actuatorAuthorityAllowed(bool landing_fallback = false);
 	bool validateOutput(const ActuatorSetpoint &output);
 	void publishOutput(const ActuatorSetpoint *output, hrt_abstime now);
+	bool airlinkControlsOutput(hrt_abstime now) const;
+	bool buildAirlinkOutput(ActuatorSetpoint &output, hrt_abstime now);
+	bool airlinkArmingAllowed(hrt_abstime now) const;
+	bool checkSingleLanding(hrt_abstime now);
+	void requestLandingDisarm(hrt_abstime now);
+	void updateLandingSafetyConfig();
 	void handleVerificationRequest();
 	void publishVerificationResponse(uint32_t sequence, nn_verification::Status status,
 					 hrt_abstime inference_time,
@@ -107,6 +120,7 @@ private:
 	// temporarily stops publishing (for example after a HIL link interruption).
 	static constexpr hrt_abstime kWatchdogInterval{10_ms};
 	static constexpr hrt_abstime kEstimatorTimeout{100_ms};
+	static constexpr hrt_abstime kAirlinkFreshness{10_ms};
 	// The WebUI pilot stream shares the HIL MAVLink link with 500 Hz sensor
 	// traffic. Keep PX4's controller-side freshness window above one scheduler
 	// hiccup; the WebUI still enforces its independent 250 ms pilot timeout.
@@ -127,6 +141,7 @@ private:
 	_unregister_ext_component_pub{ORB_ID(unregister_ext_component)};
 	uORB::Publication<vehicle_control_mode_s>
 	_config_control_setpoints_pub{ORB_ID(config_control_setpoints)};
+	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 
 	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
 	uORB::Subscription _battery_status_sub{ORB_ID(battery_status)};
@@ -145,6 +160,9 @@ private:
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+	uORB::Subscription _airlink_status_sub{ORB_ID(airlink_status)};
+	uORB::Subscription _airlink_actuator_command_sub{ORB_ID(airlink_actuator_command)};
+	uORB::Subscription _airlink_pair_command_sub{ORB_ID(airlink_pair_command)};
 
 	actuator_armed_s _actuator_armed{};
 	battery_status_s _battery_status{};
@@ -160,6 +178,9 @@ private:
 	vehicle_attitude_s _vehicle_attitude{};
 	vehicle_local_position_s _vehicle_local_position{};
 	vehicle_status_s _vehicle_status{};
+	airlink_status_s _airlink_status{};
+	airlink_actuator_command_s _airlink_actuator_command{};
+	airlink_pair_command_s _airlink_pair_command{};
 
 	ControllerBackend _backend{};
 	GroundStationGate _ground_station_gate{};
@@ -195,11 +216,21 @@ private:
 	bool _ground_station_mode_selected{false};
 	uint8_t _flight_mode_slot{0};
 	bool _gs_link_input_valid{false};
+	bool _airlink_output_owned{false};
+	bool _single_landing_active{false};
+	bool _landing_disarm_requested{false};
+	airlink_landing::Guard _landing_guard{};
+	float _landing_impact_threshold{35.f};
+	int32_t _landing_impact_confirm_ms{20};
+	float _landing_flip_threshold{70.f};
+	int32_t _landing_flip_confirm_ms{150};
+	int32_t _landing_timeout_ms{15000};
 	bool _external_mode_registered{false};
 	int8_t _external_mode_id{-1};
 	int8_t _external_arming_check_id{-1};
 	uint64_t _external_mode_request_id{0};
 	hrt_abstime _last_gs_status_publish{0};
+	hrt_abstime _last_landing_disarm_request{0};
 
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::NN_SV_TRIM1>) _param_servo_trim_1,

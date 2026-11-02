@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include <mathlib/math/Functions.hpp>
+#include <matrix/math.hpp>
 #include <px4_platform_common/events.h>
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/time.h>
@@ -25,6 +26,45 @@ static_assert(nn_verification::request::kObservationFirst
 static_assert(nn_verification::response::kMacsPerInference
 	      < debug_array_s::ARRAY_SIZE,
 	      "NN verification response exceeds DEBUG_FLOAT_ARRAY capacity");
+
+namespace
+{
+
+constexpr float kRadianToDegree{57.29577951308232f};
+constexpr float kDefaultImpactAcceleration{35.f};
+constexpr int32_t kDefaultImpactConfirmMs{20};
+constexpr float kDefaultFlipAngleDegrees{70.f};
+constexpr int32_t kDefaultFlipConfirmMs{150};
+constexpr int32_t kDefaultLandingTimeoutMs{15000};
+constexpr float kSingleLandingPilotThrottle{-0.5f}; // Maps to collective 0.25.
+
+float airlinkFloatParam(const char *name, float fallback)
+{
+	const param_t handle = param_find(name);
+
+	if (handle == PARAM_INVALID) {
+		return fallback;
+	}
+
+	float value = fallback;
+	param_get(handle, &value);
+	return PX4_ISFINITE(value) ? value : fallback;
+}
+
+int32_t airlinkIntParam(const char *name, int32_t fallback)
+{
+	const param_t handle = param_find(name);
+
+	if (handle == PARAM_INVALID) {
+		return fallback;
+	}
+
+	int32_t value = fallback;
+	param_get(handle, &value);
+	return value;
+}
+
+} // namespace
 
 NNControl::NNControl() :
 	ModuleParams(nullptr),
@@ -106,6 +146,9 @@ void NNControl::updateSubscriptions()
 	_vehicle_attitude_sub.update(&_vehicle_attitude);
 	_vehicle_local_position_sub.update(&_vehicle_local_position);
 	_vehicle_status_sub.update(&_vehicle_status);
+	_airlink_status_sub.update(&_airlink_status);
+	_airlink_actuator_command_sub.update(&_airlink_actuator_command);
+	_airlink_pair_command_sub.update(&_airlink_pair_command);
 }
 
 void NNControl::updateParameters(bool force)
@@ -225,7 +268,8 @@ void NNControl::publishArmingCheckReply(const arming_check_request_s &request)
 	// Otherwise a short DATA_RC timeout sets mode_req_other and the Commander
 	// failsafe falls through RTL/Land/Descend. GroundStationGate owns that
 	// timeout and falls back to RC while retaining the selected mode.
-	reply.can_arm_and_run = rcManualControlValid(reply.timestamp);
+	reply.can_arm_and_run = rcManualControlValid(reply.timestamp)
+				&& airlinkArmingAllowed(reply.timestamp);
 	reply.mode_req_manual_control = true;
 	reply.mode_req_attitude = true;
 	reply.mode_req_angular_velocity = true;
@@ -322,7 +366,7 @@ void NNControl::publishGsLinkStatus(hrt_abstime now)
 			  || _failsafe_flags.fd_critical_failure;
 	status.command_busy = false;
 	status.takeoff_active = false;
-	status.landing_active = false;
+	status.landing_active = _single_landing_active;
 	status.rc_switch = static_cast<float>(_flight_mode_slot);
 	_gs_link_status_pub.publish(status);
 	_last_gs_status_publish = now;
@@ -410,6 +454,9 @@ void NNControl::handleFlightPhaseTransitions()
 		_backend.reset();
 		_last_sample_timestamp = 0;
 		_takeoff_done = false;
+		_single_landing_active = false;
+		_landing_guard.reset();
+		_landing_disarm_requested = false;
 		PX4_INFO("disarm: controller state cleared");
 	}
 
@@ -437,7 +484,7 @@ void NNControl::handleFlightPhaseTransitions()
 	_last_armed = armed;
 }
 
-bool NNControl::buildInput(ControllerInput &input, hrt_abstime now)
+bool NNControl::buildInput(ControllerInput &input, hrt_abstime now, bool synthetic_landing)
 {
 	if (_vehicle_attitude.timestamp_sample == 0
 	    || now - _vehicle_attitude.timestamp_sample > kEstimatorTimeout) {
@@ -490,22 +537,31 @@ bool NNControl::buildInput(ControllerInput &input, hrt_abstime now)
 		input.heading = 0.f;
 	}
 
-	if (!_manual_command_valid) {
+	if (!_manual_command_valid && !synthetic_landing) {
 		_inhibit_reason = _manual_control_wrong_source
 				  ? InhibitReason::ManualControlNotRc : InhibitReason::StaleManualControl;
 		return false;
 	}
 
-	input.rc_roll = _effective_manual_control.roll;
-	input.rc_pitch = _effective_manual_control.pitch;
-	input.rc_yaw = _effective_manual_control.yaw;
-	input.rc_throttle = _effective_manual_control.throttle;
-	input.rc_aux[0] = _manual_control_setpoint.aux1;
-	input.rc_aux[1] = _manual_control_setpoint.aux2;
-	input.rc_aux[2] = _manual_control_setpoint.aux3;
-	input.rc_aux[3] = _manual_control_setpoint.aux4;
-	input.rc_aux[4] = _manual_control_setpoint.aux5;
-	input.rc_aux[5] = _manual_control_setpoint.aux6;
+	if (_manual_command_valid) {
+		input.rc_roll = _effective_manual_control.roll;
+		input.rc_pitch = _effective_manual_control.pitch;
+		input.rc_yaw = _effective_manual_control.yaw;
+		input.rc_throttle = _effective_manual_control.throttle;
+		input.rc_aux[0] = _manual_control_setpoint.aux1;
+		input.rc_aux[1] = _manual_control_setpoint.aux2;
+		input.rc_aux[2] = _manual_control_setpoint.aux3;
+		input.rc_aux[3] = _manual_control_setpoint.aux4;
+		input.rc_aux[4] = _manual_control_setpoint.aux5;
+		input.rc_aux[5] = _manual_control_setpoint.aux6;
+
+	} else {
+		// Level attitude hold with collective 0.25 after AIRLINK loss.
+		input.rc_roll = 0.f;
+		input.rc_pitch = 0.f;
+		input.rc_yaw = 0.f;
+		input.rc_throttle = kSingleLandingPilotThrottle;
+	}
 
 	for (float &value : input.rc_aux) {
 		if (!PX4_ISFINITE(value)) {
@@ -577,7 +633,185 @@ bool NNControl::buildInput(ControllerInput &input, hrt_abstime now)
 	return true;
 }
 
-bool NNControl::actuatorAuthorityAllowed()
+bool NNControl::airlinkArmingAllowed(hrt_abstime now) const
+{
+	int32_t pair_enabled{0};
+	const param_t handle = param_find("AIRLINK_PAIR_EN");
+
+	if (handle != PARAM_INVALID) {
+		param_get(handle, &pair_enabled);
+	}
+
+	if (!pair_enabled) {
+		return true;
+	}
+
+	return _airlink_status.timestamp != 0 && now >= _airlink_status.timestamp
+	       && now - _airlink_status.timestamp <= kAirlinkFreshness
+	       && _airlink_status.pair_mode_selected
+	       && _airlink_status.local_arm_authorized
+	       && !_airlink_status.pair_lost
+	       && !_airlink_status.pair_reattach_latched;
+}
+
+bool NNControl::airlinkControlsOutput(hrt_abstime now) const
+{
+	if (_airlink_status.timestamp == 0 || now < _airlink_status.timestamp
+	    || now - _airlink_status.timestamp > kAirlinkFreshness
+	    || _airlink_status.pair_lost || _airlink_status.pair_reattach_latched) {
+		return false;
+	}
+
+	return (_airlink_status.role == airlink_status_s::ROLE_SLAVE
+		&& _airlink_status.follower_active)
+	       || (_airlink_status.role == airlink_status_s::ROLE_MASTER
+		   && _airlink_status.pair_active);
+}
+
+bool NNControl::buildAirlinkOutput(ActuatorSetpoint &output, hrt_abstime now)
+{
+	if (_airlink_status.role == airlink_status_s::ROLE_SLAVE) {
+		if (!_airlink_actuator_command.valid
+		    || _airlink_actuator_command.timestamp == 0
+		    || now < _airlink_actuator_command.timestamp
+		    || now - _airlink_actuator_command.timestamp > kAirlinkFreshness) {
+			_inhibit_reason = InhibitReason::AirlinkCommandStale;
+			return false;
+		}
+
+		output.motors[0] = _airlink_actuator_command.motors[0];
+		output.motors[1] = _airlink_actuator_command.motors[1];
+		output.servos[0] = _airlink_actuator_command.servos[0];
+		output.servos[1] = _airlink_actuator_command.servos[1];
+		output.servos[2] = _airlink_actuator_command.servos[2];
+		return true;
+	}
+
+	if (!_airlink_pair_command.valid || _airlink_pair_command.timestamp == 0
+	    || now < _airlink_pair_command.timestamp
+	    || now - _airlink_pair_command.timestamp > kAirlinkFreshness
+	    || !PX4_ISFINITE(_airlink_pair_command.collective)
+	    || _airlink_pair_command.collective < 0.f
+	    || _airlink_pair_command.collective > 1.f) {
+		_inhibit_reason = InhibitReason::AirlinkCommandStale;
+		return false;
+	}
+
+	output.motors[0] = _airlink_pair_command.master_motors[0];
+	output.motors[1] = _airlink_pair_command.master_motors[1];
+	output.servos[0] = _airlink_pair_command.master_servos[0];
+	output.servos[1] = _airlink_pair_command.master_servos[1];
+	output.servos[2] = _airlink_pair_command.master_servos[2];
+	return true;
+}
+
+void NNControl::requestLandingDisarm(hrt_abstime now)
+{
+	if (_last_landing_disarm_request != 0 && now >= _last_landing_disarm_request
+	    && now - _last_landing_disarm_request < 100_ms) {
+		return;
+	}
+
+	vehicle_command_s command{};
+	command.timestamp = now;
+	command.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+	command.param1 = vehicle_command_s::ARMING_ACTION_DISARM;
+	command.target_system = _vehicle_status.system_id;
+	command.target_component = _vehicle_status.component_id;
+	command.source_system = _vehicle_status.system_id;
+	command.source_component = _vehicle_status.component_id;
+	_vehicle_command_pub.publish(command);
+	_last_landing_disarm_request = now;
+	_landing_disarm_requested = true;
+}
+
+void NNControl::updateLandingSafetyConfig()
+{
+	_landing_impact_threshold = math::constrain(
+					    airlinkFloatParam("AIRLINK_IMPACT", kDefaultImpactAcceleration),
+					    10.f, 200.f);
+	_landing_impact_confirm_ms = math::constrain<int32_t>(
+					     airlinkIntParam("AIRLINK_IMP_MS", kDefaultImpactConfirmMs),
+					     5, 1000);
+	_landing_flip_threshold = math::constrain(
+					  airlinkFloatParam("AIRLINK_FLIP_DEG", kDefaultFlipAngleDegrees),
+					  20.f, 180.f);
+	_landing_flip_confirm_ms = math::constrain<int32_t>(
+					   airlinkIntParam("AIRLINK_FLIP_MS", kDefaultFlipConfirmMs),
+					   10, 2000);
+	_landing_timeout_ms = math::constrain<int32_t>(
+					      airlinkIntParam("AIRLINK_LAND_MS", kDefaultLandingTimeoutMs),
+					      1000, 60000);
+}
+
+bool NNControl::checkSingleLanding(hrt_abstime now)
+{
+	if (!_single_landing_active) {
+		return false;
+	}
+
+	const hrt_abstime impact_confirm = static_cast<hrt_abstime>(
+						   _landing_impact_confirm_ms) * 1000;
+	const hrt_abstime flip_confirm = static_cast<hrt_abstime>(
+						 _landing_flip_confirm_ms) * 1000;
+	const hrt_abstime landing_timeout = static_cast<hrt_abstime>(
+						    _landing_timeout_ms) * 1000;
+	bool impact = false;
+
+	if (_vehicle_acceleration.timestamp_sample != 0
+	    && now >= _vehicle_acceleration.timestamp_sample
+	    && now - _vehicle_acceleration.timestamp_sample <= kEstimatorTimeout) {
+		const float x = _vehicle_acceleration.xyz[0];
+		const float y = _vehicle_acceleration.xyz[1];
+		const float z = _vehicle_acceleration.xyz[2];
+
+		if (PX4_ISFINITE(x) && PX4_ISFINITE(y) && PX4_ISFINITE(z)) {
+			impact = std::sqrt(x * x + y * y + z * z) >= _landing_impact_threshold;
+		}
+	}
+
+	bool flipped = false;
+
+	if (_vehicle_attitude.timestamp_sample != 0
+	    && now >= _vehicle_attitude.timestamp_sample
+	    && now - _vehicle_attitude.timestamp_sample <= kEstimatorTimeout) {
+		float norm_squared = 0.f;
+
+		for (float value : _vehicle_attitude.q) {
+			norm_squared += value * value;
+		}
+
+		if (PX4_ISFINITE(norm_squared) && std::abs(norm_squared - 1.f) <= 0.02f) {
+			const matrix::Quatf q(_vehicle_attitude.q);
+			const matrix::Eulerf euler(q);
+			const float tilt_rad = std::acos(math::constrain(
+							 std::cos(euler.phi()) * std::cos(euler.theta()),
+							 -1.f, 1.f));
+			flipped = PX4_ISFINITE(tilt_rad)
+				  && tilt_rad * kRadianToDegree >= _landing_flip_threshold;
+		}
+	}
+
+	const airlink_landing::Termination termination =
+		_landing_guard.update(now, impact, flipped, impact_confirm,
+				      flip_confirm, landing_timeout);
+
+	if (termination != airlink_landing::Termination::None) {
+		if (!_landing_disarm_requested) {
+			PX4_WARN("SINGLE_LANDING terminated: %s",
+				 termination == airlink_landing::Termination::Impact ? "impact"
+				 : termination == airlink_landing::Termination::Flip ? "flip"
+				 : "timeout");
+		}
+
+		requestLandingDisarm(now);
+		return true;
+	}
+
+	return false;
+}
+
+bool NNControl::actuatorAuthorityAllowed(bool landing_fallback)
 {
 	if (!_actuator_armed.armed) {
 		_inhibit_reason = InhibitReason::Disarmed;
@@ -612,7 +846,7 @@ bool NNControl::actuatorAuthorityAllowed()
 					|| _failsafe_flags.battery_warning >= battery_status_s::WARNING_CRITICAL);
 
 	if (estimator_failure_blocks
-	    || _failsafe_flags.manual_control_signal_lost
+	    || (!landing_fallback && _failsafe_flags.manual_control_signal_lost)
 	    || battery_failure_blocks
 	    || _failsafe_flags.fd_critical_failure
 	    || _failsafe_flags.fd_esc_arming_failure
@@ -855,6 +1089,11 @@ void NNControl::Run()
 	perf_count(_interval_perf);
 	updateSubscriptions();
 	updateParameters();
+
+	if (!_actuator_armed.armed) {
+		updateLandingSafetyConfig();
+	}
+
 	updateExternalModeRegistration(cycle_start);
 	updateManualSource(cycle_start);
 	handleFlightPhaseTransitions();
@@ -863,36 +1102,103 @@ void NNControl::Run()
 
 	ControllerInput input{};
 	ActuatorSetpoint output{};
-	bool inference_valid = buildInput(input, cycle_start);
+	bool inference_valid{false};
+	const bool airlink_controls = airlinkControlsOutput(cycle_start);
+	const bool airlink_status_fresh = _airlink_status.timestamp != 0
+					  && cycle_start >= _airlink_status.timestamp
+					  && cycle_start - _airlink_status.timestamp <= kAirlinkFreshness;
+	const bool pair_lost_airborne = airlink_status_fresh && _airlink_status.pair_lost
+					&& _airlink_status.local_airborne_latched
+					&& _actuator_armed.armed;
 
-	if (!inference_valid && _last_input_valid) {
-		_backend.reset();
-	}
-
-	_last_input_valid = inference_valid;
-
-	if (inference_valid && input.timestamp_sample == _last_sample_timestamp) {
-		inference_valid = false;
-		_inhibit_reason = InhibitReason::StaleAngularVelocity;
-	}
-
-	if (inference_valid) {
-		_last_sample_timestamp = input.timestamp_sample;
-		++_inference_count;
-		const hrt_abstime inference_start = hrt_absolute_time();
-		perf_begin(_inference_perf);
-
-		if (!_backend.run(input, output)) {
-			_inhibit_reason = InhibitReason::BackendUnavailable;
-			inference_valid = false;
+	if (airlink_controls) {
+		if (!_airlink_output_owned) {
+			_backend.reset();
+			_last_input_valid = false;
 		}
 
-		perf_end(_inference_perf);
-		_last_inference_time = hrt_elapsed_time(&inference_start);
-		_max_inference_time = math::max(_max_inference_time, _last_inference_time);
+		_airlink_output_owned = true;
+		_single_landing_active = false;
+		_landing_guard.reset();
+		_landing_disarm_requested = false;
+		inference_valid = buildAirlinkOutput(output, cycle_start);
 
-		if (_last_inference_time > kInferenceBudget) {
-			++_inference_overruns;
+	} else {
+		_airlink_output_owned = false;
+		bool use_synthetic_landing = false;
+
+		if (pair_lost_airborne || _single_landing_active) {
+			const bool gs_recovered = !_landing_disarm_requested
+						  && _gs_link_input_valid
+						  && _ground_station_gate.source()
+						  == GroundStationGate::Source::GroundStation;
+
+			if (gs_recovered) {
+				if (_single_landing_active) {
+					PX4_INFO("SINGLE_LANDING exit: GS-LINK recovered");
+				}
+
+				_single_landing_active = false;
+				_landing_guard.reset();
+				_landing_disarm_requested = false;
+
+			} else {
+				if (!_single_landing_active) {
+					_single_landing_active = true;
+					_landing_guard.start(cycle_start);
+					_landing_disarm_requested = false;
+					_backend.reset();
+					_last_input_valid = false;
+					_last_sample_timestamp = 0;
+					PX4_WARN("AIRLINK lost in flight: entering SINGLE_LANDING, collective 0.25");
+				}
+
+				if (checkSingleLanding(cycle_start)) {
+					inference_valid = false;
+					_inhibit_reason = InhibitReason::SingleLanding;
+
+				} else {
+					use_synthetic_landing = true;
+				}
+			}
+		}
+
+		if (use_synthetic_landing) {
+			inference_valid = buildInput(input, cycle_start, true);
+
+		} else if (!_single_landing_active) {
+			inference_valid = buildInput(input, cycle_start);
+		}
+
+		if (!inference_valid && _last_input_valid) {
+			_backend.reset();
+		}
+
+		_last_input_valid = inference_valid;
+
+		if (inference_valid && input.timestamp_sample == _last_sample_timestamp) {
+			inference_valid = false;
+			_inhibit_reason = InhibitReason::StaleAngularVelocity;
+		}
+
+		if (inference_valid) {
+			_last_sample_timestamp = input.timestamp_sample;
+			++_inference_count;
+			const hrt_abstime inference_start = hrt_absolute_time();
+			perf_begin(_inference_perf);
+
+			if (!_backend.run(input, output)) {
+				_inhibit_reason = InhibitReason::BackendUnavailable;
+				inference_valid = false;
+			}
+
+			perf_end(_inference_perf);
+			_last_inference_time = hrt_elapsed_time(&inference_start);
+			_max_inference_time = math::max(_max_inference_time, _last_inference_time);
+
+			if (_last_inference_time > kInferenceBudget) {
+				++_inference_overruns;
+			}
 		}
 	}
 
@@ -910,7 +1216,7 @@ void NNControl::Run()
 
 	if (inference_valid) {
 		_last_output = output;
-		authority = actuatorAuthorityAllowed();
+		authority = actuatorAuthorityAllowed(_single_landing_active);
 	}
 
 	const bool actuator_output_allowed = inference_valid && authority
@@ -975,6 +1281,8 @@ const char *NNControl::reasonString(InhibitReason reason)
 	case InhibitReason::InvalidOutput: return "invalid controller output";
 	case InhibitReason::BackendOutputDisabled: return "backend output disabled";
 	case InhibitReason::AirframeMismatch: return "identified model airframe mismatch";
+	case InhibitReason::AirlinkCommandStale: return "AIRLINK command missing/stale";
+	case InhibitReason::SingleLanding: return "SINGLE_LANDING termination";
 	}
 
 	return "unknown";
@@ -1042,6 +1350,9 @@ int NNControl::print_status()
 		 (unsigned long)_backend.verificationWeightBytes(),
 		 (unsigned long)_backend.verificationChecksum());
 	PX4_INFO("actuator output: %s", _output_enabled ? "ENABLED" : "inhibited");
+	PX4_INFO("AIRLINK fallback: %s, output owner: %s",
+		 _single_landing_active ? "SINGLE_LANDING" : "normal",
+		 _airlink_output_owned ? "AIRLINK" : "local C_SINGLE");
 	PX4_INFO("inhibit reason: %s", reasonString(_inhibit_reason));
 	PX4_INFO("inferences: %lu, rejected cycles: %lu",
 		 (unsigned long)_inference_count, (unsigned long)_rejected_count);

@@ -1,0 +1,7 @@
+menuconfig MODULES_AIRLINK
+	bool "AIRLINK dual-aircraft serial transport"
+	default n
+	---help---
+		Build the AIRLINK v1 6 Mbaud full-duplex serial transport,
+		protocol state machine, reliable events and PX4 sensor/arming
+		integration.
