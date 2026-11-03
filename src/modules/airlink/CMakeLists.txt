@@ -12,6 +12,7 @@ px4_add_module(
 	SRCS
 		Airlink.cpp
 		Airlink.hpp
+		AirlinkImu.hpp
 		AirlinkProtocol.hpp
 		AirlinkSession.cpp
 		AirlinkSession.hpp

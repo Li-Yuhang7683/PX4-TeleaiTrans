@@ -122,6 +122,7 @@ public:
 	size_t tx_queue_size() const { return _tx_count; }
 
 	bool queue_sensor_state(const SensorState &sensor, uint64_t now_us);
+	bool queue_yaw_reference(const YawReference &reference, uint64_t now_us);
 	bool query_control_tx_allowed(uint64_t now_us) const;
 	bool queue_actuator_command(const ActuatorCommand &command, float collective, uint64_t now_us);
 	bool request_control_enable(uint64_t now_us);
@@ -143,6 +144,11 @@ public:
 	uint32_t last_peer_age_us(uint64_t now_us) const;
 	uint32_t last_peer_sensor_age_us(uint64_t now_us) const;
 	uint32_t last_peer_control_age_us(uint64_t now_us) const;
+	uint16_t last_peer_sensor_sequence() const { return _last_peer_sensor_sequence; }
+	uint64_t last_peer_sensor_arrival_us() const { return _last_peer_sensor_us; }
+	uint16_t last_peer_yaw_sequence() const { return _last_peer_yaw_sequence; }
+	uint64_t last_peer_yaw_arrival_us() const { return _last_peer_yaw_us; }
+	uint8_t peer_sensor_consecutive() const { return _peer_sensor_consecutive; }
 
 private:
 	static constexpr size_t kTxQueueSize{16};
@@ -153,7 +159,8 @@ private:
 	static constexpr uint64_t kHandshakeRestartDelayUs{50'000};
 	static constexpr uint64_t kDuplicateRetentionUs{60'000'000};
 	static constexpr uint32_t kRequiredCapabilities{Single | Pair | PairArmCapability | GsPosition
-			| SingleLanding | LinkTest | SensorStateV1 | Output2M3s};
+			| SingleLanding | LinkTest | SensorStateV1 | Output2M3s
+			| CompositeYawReference};
 
 	struct PendingTemplate {
 		bool active{false};
@@ -242,6 +249,7 @@ private:
 	uint32_t _peer_session{0};
 	uint16_t _tx_sequence{0};
 	uint16_t _last_peer_sensor_sequence{0};
+	uint16_t _last_peer_yaw_sequence{0};
 	uint16_t _last_peer_control_sequence{0};
 	LinkState _state{LinkState::Down};
 	LocalStatus _local{};
@@ -259,6 +267,7 @@ private:
 	uint64_t _last_peer_frame_us{0};
 	uint64_t _last_peer_heartbeat_us{0};
 	uint64_t _last_peer_sensor_us{0};
+	uint64_t _last_peer_yaw_us{0};
 	uint64_t _last_peer_control_us{0};
 	uint64_t _last_local_sensor_sent_us{0};
 	uint64_t _last_local_control_sent_us{0};
@@ -279,6 +288,7 @@ private:
 	uint8_t _local_sensor_consecutive{0};
 	uint8_t _local_control_consecutive{0};
 	bool _has_peer_sensor_sequence{false};
+	bool _has_peer_yaw_sequence{false};
 	bool _has_peer_control_sequence{false};
 
 	Frame _tx_queue[kTxQueueSize] {};

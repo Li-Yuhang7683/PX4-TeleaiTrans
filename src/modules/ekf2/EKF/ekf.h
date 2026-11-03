@@ -420,6 +420,34 @@ public:
 
 	void updateParameters();
 
+	/**
+	 * Initialize yaw from an externally validated prior while preserving the
+	 * EKF's current roll and pitch. This is used by composite_attitude after
+	 * the independent core has completed gravity/tilt alignment.
+	 */
+	void resetYawToExternalObservation(float yaw, float yaw_variance)
+	{
+		resetQuatStateYaw(yaw, yaw_variance);
+		_control_status.flags.yaw_align = true;
+	}
+
+	/**
+	 * Initialize the complete attitude from a validated external quaternion.
+	 * Rotation variances are expressed in NED and ordered roll, pitch, yaw.
+	 */
+	void resetAttitudeToExternalObservation(const matrix::Quatf &attitude,
+			const matrix::Vector3f &rotation_variance_ned);
+
+ // Start an independent filter directly from an available aircraft attitude.
+ void initializeAttitudeFromExternalObservation(const matrix::Quatf &attitude,
+   const matrix::Vector3f &rotation_variance_ned)
+ {
+  initialiseCovariance();
+  resetAttitudeToExternalObservation(attitude, rotation_variance_ned);
+  _output_predictor.alignOutputFilter(_state.quat_nominal, _state.vel, _gpos);
+  _filter_initialised = true;
+ }
+
 	friend class AuxGlobalPosition;
 
 private:

@@ -1,0 +1,172 @@
+module_name: comp_attitude
+parameters:
+- group: Composite Attitude Estimator
+  definitions:
+    CEKF_EN:
+      description:
+        short: Enable composite attitude estimator
+      type: boolean
+      default: 0
+    CEKF_MSTR_YAW:
+      description:
+        short: Master FRD vector mapping yaw A to C
+        long: "v_C = Rz_FRD(CEKF_MSTR_YAW) v_A. Positive rotates vector components about +Z down. C forward is 30 deg right of A forward at the default -30 deg mapping. Legacy Z-up values require recalibration."
+      type: float
+      default: -30.0
+      unit: deg
+      decimal: 2
+    CEKF_SLV_YAW:
+      description:
+        short: Slave FRD vector mapping yaw B to C
+        long: "v_C = Rz_FRD(CEKF_SLV_YAW) v_B. q_AB = Rz_FRD(CEKF_SLV_YAW - CEKF_MSTR_YAW). C forward is 30 deg left of B forward at the default +30 deg mapping. Legacy Z-up values require recalibration."
+      type: float
+      default: 30.0
+      unit: deg
+      decimal: 2
+    CEKF_PREDICT_US:
+      description:
+        short: Composite EKF prediction interval
+      type: int32
+      default: 10000
+      min: 1000
+      max: 20000
+      unit: us
+    CEKF_GYR_NOISE:
+      description:
+        short: Composite gyro process noise
+      type: float
+      default: 0.02
+      min: 0.0001
+      max: 0.1
+      unit: rad/s
+      decimal: 4
+    CEKF_ACC_NOISE:
+      description:
+        short: Composite accelerometer process noise
+      type: float
+      default: 0.50
+      min: 0.01
+      max: 2.0
+      unit: m/s^2
+      decimal: 2
+    CEKF_ANGERR:
+      description:
+        short: Initial tilt uncertainty
+      type: float
+      default: 0.05
+      min: 0.0
+      max: 0.5
+      unit: rad
+      decimal: 3
+    CEKF_GBIAS:
+      description:
+        short: Initial gyro bias uncertainty
+      type: float
+      default: 0.05
+      min: 0.0
+      max: 0.5
+      unit: rad/s
+      decimal: 3
+    CEKF_ABIAS:
+      description:
+        short: Initial accelerometer bias uncertainty
+      type: float
+      default: 0.30
+      min: 0.0
+      max: 2.0
+      unit: m/s^2
+      decimal: 2
+    CEKF_GB_NOISE:
+      description:
+        short: Gyro bias random walk
+      type: float
+      default: 0.001
+      min: 0.0
+      max: 0.1
+      unit: rad/s^2
+      decimal: 5
+    CEKF_AB_NOISE:
+      description:
+        short: Accelerometer bias random walk
+      type: float
+      default: 0.003
+      min: 0.0
+      max: 0.1
+      unit: m/s^3
+      decimal: 5
+    CEKF_IMU_CTRL:
+      description:
+        short: Composite IMU fusion control
+      type: bitmask
+      bit:
+        0: Gyro bias
+        1: Accelerometer bias
+        2: Gravity vector
+      default: 7
+      min: 0
+      max: 7
+    CEKF_YAW_TAU:
+      description:
+        short: Composite yaw reference low-pass time constant
+      type: float
+      default: 1.0
+      min: 0.2
+      max: 10.0
+      unit: s
+      decimal: 2
+    CEKF_YAW_NSD:
+      description:
+        short: Composite yaw reference measurement noise
+      type: float
+      default: 0.10
+      min: 0.01
+      max: 1.0
+      unit: rad
+      decimal: 3
+    CEKF_LEVER_EN:
+      description:
+        short: Enable translational lever-arm correction
+      type: boolean
+      default: 0
+    CEKF_POS_AX:
+      description:
+        short: Master IMU X position relative to composite CG
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3
+    CEKF_POS_AY:
+      description:
+        short: Master IMU Y position relative to composite CG
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3
+    CEKF_POS_AZ:
+      description:
+        short: Master IMU Z position relative to composite CG
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3
+    CEKF_POS_BX:
+      description:
+        short: Slave IMU X position relative to composite CG, expressed in C
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3
+    CEKF_POS_BY:
+      description:
+        short: Slave IMU Y position relative to composite CG, expressed in C
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3
+    CEKF_POS_BZ:
+      description:
+        short: Slave IMU Z position relative to composite CG, expressed in C
+      type: float
+      default: 0.0
+      unit: m
+      decimal: 3

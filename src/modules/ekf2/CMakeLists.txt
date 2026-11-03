@@ -287,3 +287,8 @@ px4_add_module(
 if(BUILD_TESTING)
 	add_subdirectory(test)
 endif()
+
+if(CONFIG_MODULES_COMP_ATTITUDE)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../comp_attitude
+			 ${CMAKE_CURRENT_BINARY_DIR}/comp_attitude)
+endif()

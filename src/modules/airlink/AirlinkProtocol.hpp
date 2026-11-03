@@ -12,7 +12,8 @@
 #include <cstring>
 
 /**
- * AIRLINK v1 wire contract.
+ * AIRLINK v2 wire contract. Version 1 frames remain parser-compatible for
+ * diagnostics, but v2 handshakes require CompositeYawReference capability.
  *
  * This file intentionally uses explicit little-endian field serialization.
  * Do not cast it onto the wire or rely on structure padding.
@@ -24,7 +25,8 @@ static constexpr uint8_t kSof0{0xA5};
 static constexpr uint8_t kSof1{0x5A};
 static constexpr uint8_t kEof0{0x5A};
 static constexpr uint8_t kEof1{0xA5};
-static constexpr uint8_t kVersion{1};
+static constexpr uint8_t kMinSupportedVersion{1};
+static constexpr uint8_t kVersion{2};
 static constexpr size_t kHeaderSize{16};
 static constexpr size_t kCrcSize{4};
 static constexpr size_t kEofSize{2};
@@ -53,6 +55,7 @@ enum class Role : uint8_t {
 
 enum class MessageId : uint8_t {
 	SensorState = 0x01,
+	YawReference = 0x02,
 	ActuatorCommand = 0x01,
 	Heartbeat = 0x02,
 	ControlEnable = 0x03,
@@ -118,7 +121,8 @@ enum CapabilityFlags : uint32_t {
 	LinkTest = 1u << 5,
 	SensorStateV1 = 1u << 6,
 	Output2M3s = 1u << 7,
-	ReservedCapabilityFlags = 0xFFFFFF00u,
+	CompositeYawReference = 1u << 8,
+	ReservedCapabilityFlags = 0xFFFFFE00u,
 };
 
 enum HandshakeStateFlags : uint32_t {
@@ -239,6 +243,28 @@ struct SensorState {
 	uint16_t battery_voltage_mv{0};
 };
 
+// A received packet can be fresh while its IMU payload is unavailable.
+inline bool sensor_imu_valid(uint16_t flags, uint32_t sample_time_us)
+{
+	constexpr uint16_t required = AccelValid | GyroValid | SampleFresh;
+	return sample_time_us != 0 && (flags & required) == required;
+}
+
+enum YawReferenceFlags : uint16_t {
+	YawValid = 1u << 0,
+	YawDegraded = 1u << 1,
+	ReservedYawReferenceFlags = 0xFFFCu,
+};
+
+struct YawReference {
+	uint32_t source_sample_time_us{0};
+	float yaw_rad{0.f};
+	float yaw_sigma_rad{0.f};
+	uint8_t reset_counter{0};
+	uint8_t quality{0};
+	uint16_t flags{0};
+};
+
 struct ActuatorCommand {
 	float upper_motor{0.f};
 	float lower_motor{0.f};
@@ -298,6 +324,7 @@ struct LinkTestDataHeader {
 };
 
 static constexpr size_t kSensorPayloadSize{42};
+static constexpr size_t kYawReferencePayloadSize{12};
 static constexpr size_t kActuatorPayloadSize{6};
 static constexpr size_t kHeartbeatPayloadSize{4};
 static constexpr size_t kReliableEventPayloadSize{12};
@@ -400,6 +427,10 @@ inline bool valid_frame_flags(FrameType frame_type, uint8_t message_id, uint8_t 
 			return flags == 0;
 		}
 
+		if (message_id == static_cast<uint8_t>(MessageId::YawReference)) {
+			return flags == 0;
+		}
+
 		if (message_id == static_cast<uint8_t>(MessageId::LinkTestData)) {
 			return flags == 0 || flags == Response;
 		}
@@ -453,6 +484,10 @@ inline bool expected_payload_length(FrameType frame_type, uint8_t message_id, ui
 		switch (static_cast<MessageId>(message_id)) {
 		case MessageId::SensorState:
 			minimum = maximum = kSensorPayloadSize;
+			return true;
+
+		case MessageId::YawReference:
+			minimum = maximum = kYawReferencePayloadSize;
 			return true;
 
 		case MessageId::LinkTestData:
@@ -517,6 +552,7 @@ inline bool build_frame(const Header &header, const uint8_t *payload, uint16_t p
 	frame_len = 0;
 
 	if (payload == nullptr || output == nullptr || payload_len > kMaxPayload
+	    || header.version < kMinSupportedVersion || header.version > kVersion
 	    || !valid_message_for_frame_type(header.frame_type, header.message_id)
 	    || !roles_are_opposite(header.source_role, header.dest_role)
 	    || header.source_session == 0
@@ -630,7 +666,7 @@ public:
 			header.sequence = read_u16(_buffer + 12);
 			header.payload_len = read_u16(_buffer + 14);
 
-			if (header.version != kVersion) {
+			if (header.version < kMinSupportedVersion || header.version > kVersion) {
 				++_stats.version_errors;
 				drop_prefix(1);
 				continue;
@@ -978,6 +1014,64 @@ inline bool encode_sensor_payload(const SensorState &state, uint8_t payload[kSen
 	write_u16(payload + 38, static_cast<uint16_t>(state.esc_rpm[1]));
 	write_u16(payload + 40, state.battery_voltage_mv);
 	return true;
+}
+
+inline bool yaw_reference_is_valid(const YawReference &reference)
+{
+	if ((reference.flags & ReservedYawReferenceFlags) != 0 || reference.quality > 2
+	    || !std::isfinite(reference.yaw_rad)
+	    || !std::isfinite(reference.yaw_sigma_rad)
+	    || reference.yaw_rad < -3.1415927f || reference.yaw_rad > 3.1415927f
+	    || reference.yaw_sigma_rad < 0.f || reference.yaw_sigma_rad > 6.5535f) {
+		return false;
+	}
+
+	if ((reference.flags & YawValid) == 0) {
+		return false;
+	}
+
+	if ((reference.flags & YawDegraded) != 0 && reference.quality < 1) {
+		return false;
+	}
+
+	return true;
+}
+
+inline bool encode_yaw_reference(const YawReference &reference,
+				 uint8_t payload[kYawReferencePayloadSize])
+{
+	if (!yaw_reference_is_valid(reference)) {
+		return false;
+	}
+
+	const int32_t yaw_scaled = constrain(round_half_away(reference.yaw_rad * 10'000.f),
+					     int32_t{-31'416}, int32_t{31'416});
+	const int32_t sigma_scaled = constrain(round_half_away(reference.yaw_sigma_rad * 10'000.f),
+					      int32_t{0}, int32_t{65'535});
+	write_u32(payload, reference.source_sample_time_us);
+	write_u16(payload + 4, static_cast<uint16_t>(static_cast<int16_t>(yaw_scaled)));
+	write_u16(payload + 6, static_cast<uint16_t>(sigma_scaled));
+	payload[8] = reference.reset_counter;
+	payload[9] = reference.quality;
+	write_u16(payload + 10, reference.flags);
+	return true;
+}
+
+inline bool decode_yaw_reference(const uint8_t *payload, uint16_t payload_len,
+				 YawReference &reference)
+{
+	if (payload == nullptr || payload_len != kYawReferencePayloadSize) {
+		return false;
+	}
+
+	reference = {};
+	reference.source_sample_time_us = read_u32(payload);
+	reference.yaw_rad = static_cast<int16_t>(read_u16(payload + 4)) / 10'000.f;
+	reference.yaw_sigma_rad = read_u16(payload + 6) / 10'000.f;
+	reference.reset_counter = payload[8];
+	reference.quality = payload[9];
+	reference.flags = read_u16(payload + 10);
+	return yaw_reference_is_valid(reference);
 }
 
 inline bool actuator_command_is_valid(const ActuatorCommand &command)

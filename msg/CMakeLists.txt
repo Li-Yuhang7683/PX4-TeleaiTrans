@@ -49,8 +49,10 @@ set(msg_files
 	AirspeedWind.msg
 	AirlinkActuatorCommand.msg
 	AirlinkPairCommand.msg
+	AirlinkSensorState.msg
 	AirlinkStatus.msg
 	AirlinkTestResult.msg
+	AirlinkYawReference.msg
 	AutotuneAttitudeControlStatus.msg
 	ButtonEvent.msg
 	CameraCapture.msg
@@ -59,6 +61,9 @@ set(msg_files
 	CanInterfaceStatus.msg
 	CellularStatus.msg
 	CollisionConstraints.msg
+	CompositeAttitudeEstimate.msg
+	CompositeEstimatorStatus.msg
+	CompositeYawReference.msg
 	ControlAllocatorStatus.msg
 	Cpuload.msg
 	DatamanRequest.msg

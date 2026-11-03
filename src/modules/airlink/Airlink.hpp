@@ -7,6 +7,7 @@
 #pragma once
 
 #include "AirlinkSession.hpp"
+#include "AirlinkImu.hpp"
 
 #include <drivers/drv_hrt.h>
 #include <lib/systemlib/mavlink_log.h>
@@ -23,21 +24,22 @@
 #include <uORB/topics/action_request.h>
 #include <uORB/topics/airlink_actuator_command.h>
 #include <uORB/topics/airlink_pair_command.h>
+#include <uORB/topics/airlink_sensor_state.h>
 #include <uORB/topics/airlink_status.h>
 #include <uORB/topics/airlink_test_result.h>
+#include <uORB/topics/airlink_yaw_reference.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/esc_status.h>
 #include <uORB/topics/failsafe_flags.h>
 #include <uORB/topics/gs_link_status.h>
 #include <uORB/topics/input_rc.h>
 #include <uORB/topics/parameter_update.h>
-#include <uORB/topics/sensor_accel.h>
-#include <uORB/topics/sensor_gyro.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/composite_yaw_reference.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +66,7 @@ public:
 	void requestEmergencyWithdraw();
 	void requestLinkTest(uint16_t payload_len, uint16_t rate_hz, uint16_t duration_ms);
 	void requestLinkTestAbort();
+	void requestSensorTest(uint16_t duration_ms);
 
 private:
 	enum CommandRequest : uint32_t {
@@ -74,6 +77,7 @@ private:
 		CommandEmergency = 1u << 4,
 		CommandLinkTest = 1u << 5,
 		CommandLinkTestAbort = 1u << 6,
+		CommandSensorTest = 1u << 7,
 	};
 
 	void Run() override;
@@ -103,6 +107,11 @@ private:
 	void publishStatus(uint64_t now_us, bool pair_lost);
 	void publishTestResult(uint64_t now_us, bool complete, bool aborted);
 	void publishTestJson(uint64_t now_us);
+	void publishPeerSensor(const airlink::Frame &frame, const airlink::SensorState &sensor,
+			       uint64_t now_us);
+	void publishPeerYaw(const airlink::Frame &frame, const airlink::YawReference &reference,
+			    uint64_t now_us);
+	void finishSensorTest(uint64_t now_us);
 	bool pairCommandValid(const airlink_pair_command_s &command, uint64_t now_us) const;
 	airlink::ActuatorCommand toActuatorCommand(const float motors[2], const float servos[3]) const;
 
@@ -136,20 +145,22 @@ private:
 	uORB::Subscription _failsafe_flags_sub{ORB_ID(failsafe_flags)};
 	uORB::Subscription _gs_link_status_sub{ORB_ID(gs_link_status)};
 	uORB::Subscription _input_rc_sub{ORB_ID(input_rc)};
-	uORB::Subscription _sensor_accel_sub{ORB_ID(sensor_accel)};
-	uORB::Subscription _sensor_gyro_sub{ORB_ID(sensor_gyro)};
+	airlink::ImuSource _imu_source{};
 	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _vehicle_command_ack_sub{ORB_ID(vehicle_command_ack)};
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _pair_command_sub{ORB_ID(airlink_pair_command)};
+	uORB::Subscription _yaw_reference_sub{ORB_ID(composite_yaw_reference)};
 
 	uORB::Publication<vehicle_command_s> _vehicle_command_pub{ORB_ID(vehicle_command)};
 	uORB::Publication<airlink_actuator_command_s>
 	_actuator_command_pub{ORB_ID(airlink_actuator_command)};
 	uORB::Publication<airlink_status_s> _status_pub{ORB_ID(airlink_status)};
 	uORB::Publication<airlink_test_result_s> _test_result_pub{ORB_ID(airlink_test_result)};
+	uORB::Publication<airlink_sensor_state_s> _sensor_state_pub{ORB_ID(airlink_sensor_state)};
+	uORB::Publication<airlink_yaw_reference_s> _yaw_reference_pub{ORB_ID(airlink_yaw_reference)};
 
 	actuator_armed_s _actuator_armed{};
 	action_request_s _action_request{};
@@ -158,19 +169,19 @@ private:
 	failsafe_flags_s _failsafe_flags{};
 	gs_link_status_s _gs_link_status{};
 	input_rc_s _input_rc{};
-	sensor_accel_s _sensor_accel{};
-	sensor_gyro_s _sensor_gyro{};
 	vehicle_angular_velocity_s _vehicle_angular_velocity{};
 	vehicle_attitude_s _vehicle_attitude{};
 	vehicle_status_s _vehicle_status{};
 	vehicle_command_ack_s _vehicle_command_ack{};
 	vehicle_command_s _vehicle_command{};
 	airlink_pair_command_s _pair_command{};
+	composite_yaw_reference_s _yaw_reference{};
 
 	px4::atomic<uint32_t> _commands{0};
 	uint16_t _requested_test_payload_len{256};
 	uint16_t _requested_test_rate_hz{500};
 	uint16_t _requested_test_duration_ms{5000};
+	uint16_t _requested_sensor_test_duration_ms{5000};
 
 	uint64_t _last_received_control_us{0};
 	uint16_t _last_received_control_sequence{0};
@@ -181,8 +192,10 @@ private:
 	uint64_t _last_session_tick_us{0};
 	uint64_t _last_sensor_tx_us{0};
 	uint64_t _last_control_tx_us{0};
+	uint64_t _last_yaw_tx_us{0};
 	uint64_t _last_status_pub_us{0};
 	uint64_t _last_test_result_us{0};
+	uint64_t _sensor_test_until_us{0};
 	uint32_t _test_baseline_crc_errors{0};
 	uint32_t _test_baseline_length_errors{0};
 	uint32_t _test_baseline_session_errors{0};
@@ -190,6 +203,16 @@ private:
 	uint32_t _test_baseline_buffer_overflows{0};
 	uint32_t _test_baseline_partial_timeouts{0};
 	uint32_t _write_failures{0};
+	uint32_t _sensor_rx_frames{0};
+	uint32_t _sensor_bad_frames{0};
+	uint32_t _sensor_duplicate_frames{0};
+	uint32_t _sensor_gap_frames{0};
+	uint32_t _sensor_test_start_rx{0};
+	uint32_t _sensor_test_start_bad{0};
+	uint32_t _sensor_test_start_duplicate{0};
+	uint32_t _sensor_test_start_gap{0};
+	uint16_t _sensor_last_sequence{0};
+	bool _sensor_has_last_sequence{false};
 	int _last_write_errno{0};
 	uint32_t _open_failures{0};
 	bool _arm_command_active{false};
@@ -198,6 +221,7 @@ private:
 	bool _pair_lost_latched{false};
 	bool _follower_control_published{false};
 	bool _operator_arm_requested{false};
+	bool _sensor_test_active{false};
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::AIRLINK_ROLE>) _param_role,

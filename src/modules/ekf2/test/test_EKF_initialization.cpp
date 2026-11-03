@@ -191,6 +191,20 @@ TEST_F(EkfInitializationTest, initializeWithZeroTiltNotAtRest)
 	learningCorrectAccelBias();
 }
 
+TEST_F(EkfInitializationTest, resetAttitudeToExternalObservation)
+{
+	_sensor_simulator.runSeconds(1);
+
+	const Quatf external_attitude(Eulerf(0.1f, -0.2f, 1.2f));
+	const Vector3f rotation_variance{0.001f, 0.001f, 0.01f};
+	_ekf->resetAttitudeToExternalObservation(external_attitude, rotation_variance);
+
+	EXPECT_TRUE(_ekf->control_status_flags().tilt_align);
+	EXPECT_TRUE(_ekf->control_status_flags().yaw_align);
+	EXPECT_TRUE(matrix::isEqual(_ekf->getQuaternion(), external_attitude));
+	EXPECT_TRUE(matrix::isEqual(_ekf->getRotVarNed(), rotation_variance));
+}
+
 TEST_F(EkfInitializationTest, initializeWithTiltNoGyroBiasEstimate)
 {
 	const float pitch = math::radians(30.0f);
@@ -419,4 +433,20 @@ TEST_F(EkfInitializationTest, initializeWithRoll90)
 
 	_sensor_simulator.runSeconds(1.f);
 	learningCorrectAccelBias();
+}
+
+TEST_F(EkfInitializationTest, initializeDirectlyFromMasterWhileRotating)
+{
+	const Quatf attitude(Eulerf(0.1f, -0.2f, 1.2f));
+	const Vector3f variance{0.001f, 0.001f, 0.01f};
+	_ekf->initializeAttitudeFromExternalObservation(attitude, variance);
+	EXPECT_TRUE(_ekf->control_status_flags().tilt_align);
+	EXPECT_TRUE(_ekf->control_status_flags().yaw_align);
+	EXPECT_TRUE(matrix::isEqual(_ekf->getQuaternion(), attitude));
+	_sensor_simulator.simulateOrientation(attitude);
+	// Exceeds the stock 15 deg/s static initialization limit.
+	_sensor_simulator._imu.setGyroData(Vector3f(0.f, 0.f, 0.5f));
+	_sensor_simulator.runSeconds(0.1f);
+	EXPECT_TRUE(_ekf->attitude_valid());
+	EXPECT_GT(fabsf(Eulerf(_ekf->getQuaternion()).psi() - 1.2f), 0.01f);
 }

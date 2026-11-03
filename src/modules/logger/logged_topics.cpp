@@ -151,6 +151,14 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic("vtol_vehicle_status", 200);
 	add_topic("wind", 1000);
 
+	// Composite attitude estimator and the exact AIRLINK samples it consumes.
+	add_topic("airlink_status", 500);
+	add_topic("airlink_sensor_state", 500);
+	add_topic("airlink_yaw_reference", 1000);
+	add_topic("composite_attitude_estimate", 500);
+	add_topic("composite_estimator_status", 100);
+	add_topic("composite_yaw_reference", 1000);
+
 	// multi topics
 	add_optional_topic_multi("actuator_outputs", 100, 3);
 	add_optional_topic_multi("airspeed_wind", 1000, 4);

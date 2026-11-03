@@ -163,3 +163,46 @@ void Ekf::resetQuatStateYaw(float yaw, float yaw_variance)
 
 	_time_last_heading_fuse = _time_delayed_us;
 }
+
+void Ekf::resetAttitudeToExternalObservation(const Quatf &attitude,
+		const Vector3f &rotation_variance_ned)
+{
+	const Quatf quat_before_reset = _state.quat_nominal;
+	const Quatf quat_after_reset = attitude.normalized();
+
+	if (!quat_after_reset.isAllFinite()) {
+		return;
+	}
+
+	if (rotation_variance_ned.isAllFinite() && (rotation_variance_ned.min() > FLT_EPSILON)) {
+		resetQuatCov(rotation_variance_ned);
+	}
+
+	_state.quat_nominal = quat_after_reset;
+	_R_to_earth = Dcmf(quat_after_reset);
+
+	const Quatf q_error((quat_after_reset * quat_before_reset.inversed()).normalized());
+	_output_predictor.resetQuaternion(q_error);
+
+#if defined(CONFIG_EKF2_EXTERNAL_VISION)
+
+	if (_ev_q_error_initialized) {
+		const Quatf ev_q_error_updated = (q_error * _ev_q_error_filt.getState()).normalized();
+		_ev_q_error_filt.reset(ev_q_error_updated);
+	}
+
+#endif // CONFIG_EKF2_EXTERNAL_VISION
+
+	if (_state_reset_status.reset_count.quat == _state_reset_count_prev.quat) {
+		_state_reset_status.quat_change = q_error;
+
+	} else {
+		_state_reset_status.quat_change = q_error * _state_reset_status.quat_change;
+		_state_reset_status.quat_change.normalize();
+	}
+
+	_state_reset_status.reset_count.quat++;
+	_control_status.flags.tilt_align = true;
+	_control_status.flags.yaw_align = true;
+	_time_last_heading_fuse = _time_delayed_us;
+}

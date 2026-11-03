@@ -139,7 +139,8 @@ uint32_t Airlink::computeConfigCrc32c()
 	config[offset++] = static_cast<uint8_t>(airlink::kVersion);
 	config[offset++] = kOutputLayout2M3s;
 	config[offset++] = static_cast<uint8_t>(airlink::SensorStateV1
-					       | airlink::Output2M3s);
+					       | airlink::Output2M3s
+					       | airlink::CompositeYawReference);
 	airlink::write_u16(config + offset, kCollectiveNeutralMilli);
 	offset += 2;
 	airlink::write_u16(config + offset, kCollectiveDescentMilli);
@@ -233,10 +234,7 @@ airlink::LocalStatus Airlink::makeLocalStatus(uint64_t now_us)
 airlink::SensorState Airlink::makeSensorState(uint64_t now_us)
 {
 	airlink::SensorInput input{};
-	const uint64_t accel_sample = _sensor_accel.timestamp_sample != 0
-				      ? _sensor_accel.timestamp_sample : _sensor_accel.timestamp;
-	const uint64_t gyro_sample = _sensor_gyro.timestamp_sample != 0
-				     ? _sensor_gyro.timestamp_sample : _sensor_gyro.timestamp;
+	const uint64_t imu_sample = _imu_source.timestampSample();
 	const uint64_t attitude_sample = _vehicle_attitude.timestamp_sample != 0
 					 ? _vehicle_attitude.timestamp_sample : _vehicle_attitude.timestamp;
 	const uint64_t angular_sample =
@@ -244,10 +242,11 @@ airlink::SensorState Airlink::makeSensorState(uint64_t now_us)
 		? _vehicle_angular_velocity.timestamp_sample
 		: _vehicle_angular_velocity.timestamp;
 
-	const float accelerometer[3] {_sensor_accel.x, _sensor_accel.y, _sensor_accel.z};
-	const float gyro[3] {_sensor_gyro.x, _sensor_gyro.y, _sensor_gyro.z};
-	input.accel_valid = finite_xyz(accelerometer);
-	input.gyro_valid = finite_xyz(gyro);
+	// vehicle_imu already contains PX4 calibration, thermal correction and
+	// board-to-body rotation. Convert its integrated values to mean SI rates
+	// before applying the existing Airlink quantization.
+	input.accel_valid = _imu_source.acceleration(input.accelerometer);
+	input.gyro_valid = _imu_source.angularVelocity(input.gyro);
 	input.attitude_valid = PX4_ISFINITE(_vehicle_attitude.q[0])
 			       && PX4_ISFINITE(_vehicle_attitude.q[1])
 			       && PX4_ISFINITE(_vehicle_attitude.q[2])
@@ -255,14 +254,12 @@ airlink::SensorState Airlink::makeSensorState(uint64_t now_us)
 	input.angular_velocity_valid = finite_xyz(_vehicle_angular_velocity.xyz);
 	input.core_sources_fresh = input.accel_valid && input.gyro_valid && input.attitude_valid
 				   && input.angular_velocity_valid
-				   && fresh_sample(now_us, accel_sample, kPeerFreshTimeout)
-				   && fresh_sample(now_us, gyro_sample, kPeerFreshTimeout)
+				   && fresh_sample(now_us, imu_sample, kPeerFreshTimeout)
+				   && fresh_sample(now_us, _imu_source.accelerationTimestamp(), kPeerFreshTimeout)
 				   && fresh_sample(now_us, attitude_sample, kPeerFreshTimeout)
 				   && fresh_sample(now_us, angular_sample, kPeerFreshTimeout);
-	input.imu_sample_time_us = static_cast<uint32_t>(gyro_sample);
+	input.imu_sample_time_us = static_cast<uint32_t>(imu_sample);
 	input.attitude_sample_time_us = static_cast<uint32_t>(attitude_sample);
-	memcpy(input.accelerometer, accelerometer, sizeof(input.accelerometer));
-	memcpy(input.gyro, gyro, sizeof(input.gyro));
 	memcpy(input.attitude_q, _vehicle_attitude.q, sizeof(input.attitude_q));
 	memcpy(input.angular_velocity, _vehicle_angular_velocity.xyz,
 	       sizeof(input.angular_velocity));
@@ -318,13 +315,13 @@ void Airlink::updateSubscriptions()
 	_failsafe_flags_sub.update(&_failsafe_flags);
 	_gs_link_status_sub.update(&_gs_link_status);
 	_input_rc_sub.update(&_input_rc);
-	_sensor_accel_sub.update(&_sensor_accel);
-	_sensor_gyro_sub.update(&_sensor_gyro);
+	_imu_source.update();
 	_vehicle_angular_velocity_sub.update(&_vehicle_angular_velocity);
 	_vehicle_attitude_sub.update(&_vehicle_attitude);
 	_vehicle_command_ack_sub.update(&_vehicle_command_ack);
 	_vehicle_status_sub.update(&_vehicle_status);
 	_pair_command_sub.update(&_pair_command);
+	_yaw_reference_sub.update(&_yaw_reference);
 }
 
 void Airlink::updateParameters(bool force)
@@ -479,7 +476,7 @@ bool Airlink::openSerial()
 
 	_serial.flush();
 	_parser.reset();
-	PX4_INFO("AIRLINK v1 on %s at %lu baud, session %08lx",
+	PX4_INFO("AIRLINK v2 on %s at %lu baud, session %08lx",
 		 _serial.getPort(), static_cast<unsigned long>(_serial.getBaudrate()),
 		 static_cast<unsigned long>(_session_id));
 	return true;
@@ -548,8 +545,46 @@ void Airlink::parseFrames(uint64_t now_us, airlink::SessionActions &actions)
 			&& frame.header.message_id
 			== static_cast<uint8_t>(airlink::MessageId::ActuatorCommand)
 			&& decode_actuator_command(frame.payload, frame.header.payload_len, command);
+		airlink::SensorState sensor{};
+		const bool sensor_candidate =
+			frame.header.frame_type == airlink::FrameType::Data
+			&& frame.header.message_id
+			== static_cast<uint8_t>(airlink::MessageId::SensorState)
+			&& decode_sensor_state(frame.payload, frame.header.payload_len, sensor);
+		airlink::YawReference yaw_reference{};
+		const bool yaw_candidate =
+			frame.header.frame_type == airlink::FrameType::Data
+			&& frame.header.message_id
+			== static_cast<uint8_t>(airlink::MessageId::YawReference)
+			&& decode_yaw_reference(frame.payload, frame.header.payload_len, yaw_reference);
 		const airlink::SessionActions received = _session.receive(frame, now_us);
 		mergeActions(actions, received);
+
+		if (sensor_candidate && _applied_role == static_cast<int32_t>(airlink::Role::Master)
+		    && frame.header.source_role == airlink::Role::Slave
+		    && frame.header.source_session == _session.peer_session_id()) {
+			const bool duplicate = _sensor_has_last_sequence
+					       && frame.header.sequence == _sensor_last_sequence;
+
+			if (!duplicate) {
+				publishPeerSensor(frame, sensor, now_us);
+				_sensor_last_sequence = frame.header.sequence;
+				_sensor_has_last_sequence = true;
+				++_sensor_rx_frames;
+
+			} else {
+				++_sensor_duplicate_frames;
+			}
+
+		} else if (sensor_candidate) {
+			++_sensor_bad_frames;
+		}
+
+		if (yaw_candidate && _applied_role == static_cast<int32_t>(airlink::Role::Slave)
+		    && frame.header.source_role == airlink::Role::Master
+		    && frame.header.source_session == _session.peer_session_id()) {
+			publishPeerYaw(frame, yaw_reference, now_us);
+		}
 
 		if (actuator_candidate
 		    && _applied_role == static_cast<int32_t>(airlink::Role::Slave)
@@ -740,6 +775,20 @@ void Airlink::handleCommands(uint64_t now_us)
 		return;
 	}
 
+	if ((commands & CommandSensorTest) != 0) {
+		_sensor_test_start_rx = _sensor_rx_frames;
+		_sensor_test_start_bad = _sensor_bad_frames;
+		_sensor_test_start_duplicate = _sensor_duplicate_frames;
+		_sensor_test_start_gap = _sensor_gap_frames;
+		_sensor_test_until_us = now_us
+				       + static_cast<uint64_t>(_requested_sensor_test_duration_ms) * 1'000;
+		_sensor_test_active = true;
+		PX4_INFO("AIRLINK sensor exchange test started on %s for %u ms",
+			 _applied_role == static_cast<int32_t>(airlink::Role::Master)
+			 ? "master receiver" : "slave sender",
+			 static_cast<unsigned>(_requested_sensor_test_duration_ms));
+	}
+
 	if ((commands & CommandArm) != 0) {
 		if (_applied_role != static_cast<int32_t>(airlink::Role::Master)) {
 			PX4_WARN("AIRLINK pair arm requires the master role");
@@ -900,6 +949,7 @@ void Airlink::publishStatus(uint64_t now_us, bool pair_lost)
 	status.timestamp_sample = now_us;
 	status.session_id = _session_id;
 	status.peer_session_id = _session.peer_session_id();
+	status.protocol_version = airlink::kVersion;
 	status.role = static_cast<uint8_t>(_applied_role);
 	status.link_state = static_cast<uint8_t>(_session.state());
 	status.peer_health_flags = _session.remote().health_flags;
@@ -1044,17 +1094,34 @@ void Airlink::Run()
 		readSerial(now, actions);
 		handleCommands(now);
 
-		if (_applied_role == static_cast<int32_t>(airlink::Role::Slave)
-		    && _session.state() == airlink::LinkState::PairActive) {
+		if (_applied_role == static_cast<int32_t>(airlink::Role::Slave)) {
 			const airlink::ActuatorCommand &command = _session.peer_actuator_command();
 
-			if (airlink::maximum(command.upper_motor, command.lower_motor) > 0.f) {
+			if (_session.state() == airlink::LinkState::PairActive
+			    && airlink::maximum(command.upper_motor, command.lower_motor) > 0.f) {
 				_airborne_latched = true;
 			}
 
 			if (period_elapsed(now, _last_sensor_tx_us, kProtocolFramePeriod)
 			    && _session.queue_sensor_state(makeSensorState(now), now)) {
 				_last_sensor_tx_us = now;
+			}
+		}
+
+		if (_applied_role == static_cast<int32_t>(airlink::Role::Master)
+		    && period_elapsed(now, _last_yaw_tx_us, 1'000'000)
+		    && (_yaw_reference.flags & airlink::YawValid) != 0) {
+			airlink::YawReference reference{};
+			reference.source_sample_time_us =
+				static_cast<uint32_t>(_yaw_reference.timestamp_sample);
+			reference.yaw_rad = _yaw_reference.yaw_rad;
+			reference.yaw_sigma_rad = _yaw_reference.yaw_sigma_rad;
+			reference.reset_counter = _yaw_reference.reset_counter;
+			reference.quality = _yaw_reference.quality;
+			reference.flags = _yaw_reference.flags;
+
+			if (_session.queue_yaw_reference(reference, now)) {
+				_last_yaw_tx_us = now;
 			}
 		}
 
@@ -1089,6 +1156,7 @@ void Airlink::Run()
 		}
 
 		flushTx();
+		finishSensorTest(now);
 
 	} else {
 		if (period_elapsed(now, _last_status_pub_us, kProtocolFramePeriod)) {
@@ -1138,6 +1206,75 @@ void Airlink::requestLinkTestAbort()
 	_commands.fetch_or(CommandLinkTestAbort);
 }
 
+void Airlink::requestSensorTest(uint16_t duration_ms)
+{
+	_requested_sensor_test_duration_ms = duration_ms;
+	_commands.fetch_or(CommandSensorTest);
+}
+
+void Airlink::publishPeerSensor(const airlink::Frame &frame,
+				const airlink::SensorState &sensor, uint64_t now_us)
+{
+	airlink_sensor_state_s output{};
+	output.timestamp = now_us;
+	output.timestamp_sample = sensor.imu_sample_time_us;
+	output.source_session = frame.header.source_session;
+	output.sequence = frame.header.sequence;
+	output.status_flags = sensor.status_flags;
+	output.imu_sample_time_us = sensor.imu_sample_time_us;
+	output.attitude_sample_time_us = sensor.attitude_sample_time_us;
+
+	for (int axis = 0; axis < 3; ++axis) {
+		output.accelerometer_raw[axis] = sensor.accelerometer[axis];
+		output.gyro_raw[axis] = sensor.gyro[axis];
+		output.angular_velocity_raw[axis] = sensor.angular_velocity[axis];
+	}
+
+	for (int i = 0; i < 4; ++i) {
+		output.attitude_q_raw[i] = sensor.attitude_q[i];
+	}
+
+	output.esc_rpm[0] = sensor.esc_rpm[0];
+	output.esc_rpm[1] = sensor.esc_rpm[1];
+	output.battery_voltage_mv = sensor.battery_voltage_mv;
+	_sensor_state_pub.publish(output);
+}
+
+void Airlink::publishPeerYaw(const airlink::Frame &frame,
+			     const airlink::YawReference &reference, uint64_t now_us)
+{
+	airlink_yaw_reference_s output{};
+	output.timestamp = now_us;
+	output.timestamp_sample = reference.source_sample_time_us;
+	output.source_session = frame.header.source_session;
+	output.sequence = frame.header.sequence;
+	output.yaw_rad = reference.yaw_rad;
+	output.yaw_sigma_rad = reference.yaw_sigma_rad;
+	output.reset_counter = reference.reset_counter;
+	output.quality = reference.quality;
+	output.flags = reference.flags;
+	_yaw_reference_pub.publish(output);
+}
+
+void Airlink::finishSensorTest(uint64_t now_us)
+{
+	if (!_sensor_test_active || now_us < _sensor_test_until_us) {
+		return;
+	}
+
+	_sensor_test_active = false;
+	const uint32_t received = _sensor_rx_frames - _sensor_test_start_rx;
+	const uint32_t duplicate = _sensor_duplicate_frames - _sensor_test_start_duplicate;
+	const uint32_t bad = _sensor_bad_frames - _sensor_test_start_bad;
+	PX4_INFO("AIRLINK_SENSOR_TEST_JSON={\"received\":%lu,\"duplicate\":%lu,"
+		 "\"bad\":%lu,\"peer_sensor_fresh\":%d,\"seq\":%u}",
+		 static_cast<unsigned long>(received),
+		 static_cast<unsigned long>(duplicate),
+		 static_cast<unsigned long>(bad),
+		 _session.last_peer_sensor_age_us(now_us) <= kPeerFreshTimeout ? 1 : 0,
+		 static_cast<unsigned>(_sensor_last_sequence));
+}
+
 int Airlink::print_status()
 {
 	const hrt_abstime now = hrt_absolute_time();
@@ -1166,6 +1303,12 @@ int Airlink::print_status()
 		 static_cast<unsigned long>(_parser.stats().resyncs),
 		 static_cast<unsigned long>(_parser.stats().buffer_overflows),
 		 static_cast<unsigned long>(_parser.stats().partial_timeouts));
+	PX4_INFO("sensor rx: frames %lu, duplicate %lu, bad %lu, peer seq %u, received age %lu us",
+		 static_cast<unsigned long>(_sensor_rx_frames),
+		 static_cast<unsigned long>(_sensor_duplicate_frames),
+		 static_cast<unsigned long>(_sensor_bad_frames),
+		 static_cast<unsigned>(_sensor_last_sequence),
+		 static_cast<unsigned long>(_session.last_peer_sensor_age_us(now)));
 	PX4_INFO("session errors: %lu, unknown messages: %lu, write failures: %lu (errno %d), open failures: %lu",
 		 static_cast<unsigned long>(_session.session_errors()),
 		 static_cast<unsigned long>(_session.unknown_messages()),
@@ -1328,6 +1471,19 @@ int Airlink::custom_command(int argc, char *argv[])
 		return PX4_OK;
 	}
 
+	if (!strcmp(argv[0], "sensortest")) {
+		uint16_t duration_ms = 5000;
+
+		if (argc > 1 && !parse_u16_in_range(argv[1], 1000, 10000, duration_ms)) {
+			return print_usage("sensor test duration must be 1000..10000 ms");
+		}
+
+		instance->requestSensorTest(duration_ms);
+		PX4_INFO("AIRLINK sensor exchange test queued for %u ms",
+			 static_cast<unsigned>(duration_ms));
+		return PX4_OK;
+	}
+
 	return print_usage("unknown command");
 }
 
@@ -1340,7 +1496,7 @@ int Airlink::print_usage(const char *reason)
 	PRINT_MODULE_DESCRIPTION(
 		R"DESCR_STR(
 ### Description
-AIRLINK v1 dual-aircraft 6 Mbaud full-duplex serial transport.
+AIRLINK v2 dual-aircraft 6 Mbaud full-duplex serial transport.
 
 The module exchanges 500 Hz sensor state and five-output actuator commands,
 implements the three-phase handshake, reliable events, explicit PAIR_ARM and
@@ -1366,6 +1522,8 @@ their veto.
 	PRINT_MODULE_USAGE_ARG("--rate-hz", "1..500 (default 500)", false);
 	PRINT_MODULE_USAGE_ARG("--payload-bytes", "32..512 (default 256)", false);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("aborttest", "Abort an active link test");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("sensortest",
+					 "Count decoded peer SENSOR_STATE frames: [duration_ms]");
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	return 0;
 }

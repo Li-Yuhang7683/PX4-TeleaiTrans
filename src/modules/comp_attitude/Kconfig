@@ -1,0 +1,10 @@
+menuconfig MODULES_COMP_ATTITUDE
+	bool "Composite dual-aircraft attitude estimator"
+	default n
+	depends on MODULES_AIRLINK
+	depends on MODULES_EKF2
+	---help---
+		Run an independent EKF2 core using the 0.5/0.5 master and slave IMUs.
+		Both aircraft map to independent composite FRD before fusion
+		(default A->C=-30 deg, B->C=+30 deg, q_AB=+60 deg). Publishes
+		estimate, health and yaw topics.

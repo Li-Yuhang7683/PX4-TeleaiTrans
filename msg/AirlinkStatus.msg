@@ -3,6 +3,7 @@ uint64 timestamp_sample
 
 uint32 session_id
 uint32 peer_session_id
+uint8 protocol_version
 
 uint8 ROLE_DISABLED = 0
 uint8 ROLE_MASTER = 1

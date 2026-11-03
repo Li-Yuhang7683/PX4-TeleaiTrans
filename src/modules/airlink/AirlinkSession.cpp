@@ -77,6 +77,7 @@ void Session::start(Role role, uint32_t session_id, const LocalStatus &local, ui
 	_state = _role == Role::Disabled ? LinkState::Down : LinkState::Down;
 	_tx_sequence = 0;
 	_last_peer_sensor_sequence = 0;
+	_last_peer_yaw_sequence = 0;
 	_last_peer_control_sequence = 0;
 	_tx_frames = 0;
 	_rx_frames = 0;
@@ -100,6 +101,7 @@ void Session::start(Role role, uint32_t session_id, const LocalStatus &local, ui
 	_last_peer_frame_us = 0;
 	_last_peer_heartbeat_us = 0;
 	_last_peer_sensor_us = 0;
+	_last_peer_yaw_us = 0;
 	_last_peer_control_us = 0;
 	_last_local_sensor_sent_us = 0;
 	_last_local_control_sent_us = 0;
@@ -114,6 +116,7 @@ void Session::start(Role role, uint32_t session_id, const LocalStatus &local, ui
 	_local_sensor_consecutive = 0;
 	_local_control_consecutive = 0;
 	_has_peer_sensor_sequence = false;
+	_has_peer_yaw_sequence = false;
 	_has_peer_control_sequence = false;
 	_link_test = {};
 }
@@ -329,7 +332,7 @@ uint16_t Session::local_health_flags(uint64_t now_us) const
 uint32_t Session::local_capabilities() const
 {
 	return Single | Pair | PairArmCapability | GsPosition | SingleLanding
-	       | LinkTest | SensorStateV1 | Output2M3s;
+	       | LinkTest | SensorStateV1 | Output2M3s | CompositeYawReference;
 }
 
 uint32_t Session::local_handshake_flags() const
@@ -1182,9 +1185,19 @@ bool Session::notify_local_arm_result(bool success, uint64_t now_us)
 
 bool Session::queue_sensor_state(const SensorState &sensor, uint64_t now_us)
 {
-	if (_role != Role::Slave || _state != LinkState::PairActive
-	    || _last_peer_control_us == 0
-	    || now_us - _last_peer_control_us > kSensorFreshTimeoutUs) {
+	const bool pair_active = _state == LinkState::PairActive;
+	const bool preheat_or_pair_setup = _state == LinkState::Ready
+					   || _state == LinkState::PairEnablePending
+					   || _state == LinkState::PairControlReady
+					   || _state == LinkState::PairArmPending
+					   || _state == LinkState::PairArmedGround;
+
+	if (_role != Role::Slave || (!pair_active && !preheat_or_pair_setup)) {
+		return false;
+	}
+
+	if (pair_active && (_last_peer_control_us == 0
+			    || now_us - _last_peer_control_us > kSensorFreshTimeoutUs)) {
 		return false;
 	}
 
@@ -1204,6 +1217,30 @@ bool Session::queue_sensor_state(const SensorState &sensor, uint64_t now_us)
 		&& now_us - _last_local_sensor_sent_us <= kSensorFreshTimeoutUs
 		? static_cast<uint8_t>(minimum<int>(255, _local_sensor_consecutive + 1)) : 1;
 	_last_local_sensor_sent_us = now_us;
+	return true;
+}
+
+bool Session::queue_yaw_reference(const YawReference &reference, uint64_t now_us)
+{
+	const bool session_usable = _state == LinkState::Ready
+				    || _state == LinkState::PairEnablePending
+				    || _state == LinkState::PairControlReady
+				    || _state == LinkState::PairArmedGround
+				    || _state == LinkState::PairActive;
+
+	if (_role != Role::Master || !session_usable || _peer_session == 0
+	    || now_us - _last_peer_frame_us > kPeerHeartbeatTimeoutUs) {
+		return false;
+	}
+
+	uint8_t payload[kYawReferencePayloadSize] {};
+
+	if (!encode_yaw_reference(reference, payload)
+	    || !queue_frame(FrameType::Data, static_cast<uint8_t>(MessageId::YawReference), 0,
+			    payload, sizeof(payload))) {
+		return false;
+	}
+
 	return true;
 }
 
@@ -1551,6 +1588,7 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 			_pending = {};
 			_completed_handshake_transaction = 0;
 			_has_peer_sensor_sequence = false;
+			_has_peer_yaw_sequence = false;
 			_has_peer_control_sequence = false;
 			_handshake_retry_after_us = now_us;
 
@@ -1607,6 +1645,20 @@ SessionActions Session::receive(const Frame &frame, uint64_t now_us)
 					_state = LinkState::PairActive;
 					actions.pair_active = true;
 				}
+			}
+
+		} else if (message_id == MessageId::YawReference) {
+			YawReference reference{};
+
+			if (_role == Role::Slave && frame.header.source_role == Role::Master
+			    && decode_yaw_reference(frame.payload, frame.header.payload_len, reference)
+			    && (!_has_peer_yaw_sequence
+				|| frame.header.sequence != _last_peer_yaw_sequence
+				|| _last_peer_yaw_us == 0
+				|| now_us - _last_peer_yaw_us > kSensorFreshTimeoutUs)) {
+				_last_peer_yaw_sequence = frame.header.sequence;
+				_last_peer_yaw_us = now_us;
+				_has_peer_yaw_sequence = true;
 			}
 
 		} else if (message_id == MessageId::LinkTestData) {
