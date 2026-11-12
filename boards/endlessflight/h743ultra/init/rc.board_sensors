@@ -1,0 +1,12 @@
+#!/bin/sh
+# EndlessFlight H7Ultra manufacturer sensor startup
+board_adc start
+# External IMU
+sch16t -s -b 1 -R 2 start
+# Internal dual IIM42652
+iim42652 -s -b 2 -R 4 start
+iim42652 -s -b 3 -R 6 start
+# Internal barometer
+spa06 -I -a 0x76 start
+# Internal magnetometer, original vendor rotation and address
+qmc5883p -I -a 0x2C -R 6 start
