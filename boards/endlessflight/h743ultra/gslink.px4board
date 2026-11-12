@@ -1,0 +1,18 @@
+# Communication-only GS-Link test configuration for EndlessFlight H7Ultra.
+# Inherits default.px4board: leave official multicopter control stack present.
+# GS-Link module is built but is not automatically started on /dev/ttyS0.
+# Current UART1 MAVLink will continue until explicitly reconfigured in a
+# separately approved propeller-free bench procedure. No GS control authority.
+CONFIG_MODULES_GS_LINK=y
+# Remove nonmulticopter/optional functions to make room for the GS-Link module.
+# Keep Commander, RC, sensors, MAVLink USB, EKF2, control allocator, MC controllers.
+CONFIG_MODULES_FW_ATT_CONTROL=n
+CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL=n
+CONFIG_MODULES_FW_POS_CONTROL=n
+CONFIG_MODULES_FW_RATE_CONTROL=n
+CONFIG_MODULES_VTOL_ATT_CONTROL=n
+CONFIG_MODULES_GYRO_FFT=n
+CONFIG_MODULES_PAYLOAD_DELIVERER=n
+CONFIG_MODULES_UXRCE_DDS_CLIENT=n
+CONFIG_DRIVERS_UAVCAN=n
+CONFIG_DRIVERS_TAP_ESC=n
