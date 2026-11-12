@@ -43,7 +43,7 @@ static constexpr int16_t combine(uint8_t msb, uint8_t lsb)
 QMC5883P::QMC5883P(const I2CSPIDriverConfig &config) :
 	I2C(config),
 	I2CSPIDriver(config),
-	_px4_mag(get_device_id(), config.rotation, config.external)
+	_px4_mag(get_device_id(), config.rotation)
 {
 }
 
@@ -262,7 +262,7 @@ bool QMC5883P::Configure()
 	}
 
 	_px4_mag.set_scale(1.f / 15000.f); // 15000 LSB/Gauss (Field Range = ±2G)
-	_px4_mag.set_range(2.f);
+	// _px4_mag.set_range(2.f);
 
 	return success;
 }

@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# board specific extras init
+#------------------------------------------------------------------------------
+
+# enable onboard OSD chip
+# atxxxx start -s
+
+# Start the optional composite estimator only in nncontrol firmware.
+if [ -f ${R}etc/init.d/airframes/22001_direct_actuator_controller ]
+then
+    comp_attitude start
+fi

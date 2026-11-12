@@ -10,3 +10,14 @@ iim42652 -s -b 3 -R 6 start
 spa06 -I -a 0x76 start
 # Internal magnetometer, original vendor rotation and address
 qmc5883p -I -a 0x2C -R 6 start
+
+# H7ULTRA_NNCONTROL_OUTPUT_DEFAULTS
+# Override airframe defaults, preserve saved QGC parameter values.
+if [ -f ${R}etc/init.d/airframes/22001_direct_actuator_controller ]
+then
+    param set-default PWM_MAIN_TIM0 -4
+    param set-default PWM_MAIN_TIM1 400
+    param set-default PWM_MAIN_TIM2 400
+    param set-default DSHOT_BIDIR_EN 1
+    param set-default GPS_1_CONFIG 0
+fi

@@ -11,7 +11,7 @@ land_detector start multicopter
 # the airframe-1 identification and the 3100 kV upper-rotor in-air table.
 # nn_control latches the model at startup, so select it before starting.
 param set NN_LQI_MODEL 2
-gs_link start -d /dev/ttyS0 -b 4000000
+gs_link start -d /dev/ttyS0 -b 5000000
 # AIRLINK defaults to AIRLINK_ROLE=0. Set the role from QGC or NSH only while
 # disarmed; ttyS1 is UART2/GPS2 on this board mapping.
 airlink start -d /dev/ttyS1 -b 6000000
